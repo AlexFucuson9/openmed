@@ -38,7 +38,9 @@ def run_from_args(
         getattr(args, "text_column", None),
     )
     if not columns:
-        stderr.write("At least one --text-column or --text-columns value is required.\n")
+        stderr.write(
+            "At least one --text-column or --text-columns value is required.\n"
+        )
         return 1
 
     try:

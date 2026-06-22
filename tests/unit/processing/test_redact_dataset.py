@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from openmed.cli import main_module
 from openmed.core.pii import DeidentificationResult, PIIEntity
 from openmed.processing.batch import redact_dataset
@@ -94,6 +96,46 @@ def test_redact_dataset_jsonl_preserves_non_text_columns_and_summarizes(
     _assert_summary_has_no_fixture_phi(result.summary.to_dict())
 
 
+def test_redact_dataset_parquet_preserves_schema_when_pyarrow_is_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    pyarrow = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    input_path = tmp_path / "patients.parquet"
+    output_path = tmp_path / "patients.redacted.parquet"
+    table = pyarrow.table(
+        {
+            "id": [1, 2],
+            "note": [
+                "Patient John Doe called 555-0101",
+                "Patient Jane Roe emailed jane@example.test",
+            ],
+            "age": [42, 37],
+        }
+    )
+    pq.write_table(table, input_path)
+    monkeypatch.setattr("openmed.core.pii.deidentify", _fake_deidentify)
+
+    result = redact_dataset(
+        input_path,
+        text_columns=["note"],
+        output_path=output_path,
+        batch_size=1,
+    )
+
+    redacted_rows = pq.read_table(output_path).to_pylist()
+    assert redacted_rows == [
+        {"id": 1, "note": "Patient [PERSON] called [PHONE]", "age": 42},
+        {"id": 2, "note": "Patient [PERSON] emailed [EMAIL]", "age": 37},
+    ]
+    assert result.summary.total_rows == 2
+    assert result.summary.total_spans == 4
+    assert result.summary.per_label_counts == {"PERSON": 2, "PHONE": 1, "EMAIL": 1}
+    _assert_summary_has_no_fixture_phi(result.summary.to_dict())
+
+
 def test_redact_dataset_cli_emits_phi_free_audit_summary(
     tmp_path: Path,
     monkeypatch,
@@ -129,6 +171,44 @@ def test_redact_dataset_cli_emits_phi_free_audit_summary(
     assert "John Doe" not in output_path.read_text(encoding="utf-8")
     assert "555-0101" not in output_path.read_text(encoding="utf-8")
     _assert_summary_has_no_fixture_phi(summary)
+
+
+def test_redact_dataset_cli_can_disable_keep_year(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "patients.csv"
+    output_path = tmp_path / "patients.redacted.csv"
+    input_path.write_text(
+        "id,note\n1,Patient John Doe called 555-0101\n",
+        encoding="utf-8",
+    )
+    calls: list[dict] = []
+
+    def fake_deidentify(text: str, **kwargs) -> DeidentificationResult:
+        calls.append(kwargs)
+        return _fake_deidentify(text, **kwargs)
+
+    monkeypatch.setattr("openmed.core.pii.deidentify", fake_deidentify)
+
+    exit_code = main_module.main(
+        [
+            "redact-dataset",
+            str(input_path),
+            "--text-column",
+            "note",
+            "--output",
+            str(output_path),
+            "--no-keep-year",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert calls
+    assert calls[0]["keep_year"] is False
 
 
 def test_redact_dataset_requires_text_columns(tmp_path: Path, capsys) -> None:
